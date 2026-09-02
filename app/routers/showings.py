@@ -3,26 +3,29 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-
-from .. import models, auth
+from .. import models, auth, schemas
 from ..database import get_db
 from ..services.enrollment import auto_enroll
-
 router = APIRouter(prefix="/showings", tags=["showings"])
-
-
 class ShowingCreate(BaseModel):
     property_id: str
     buyer_contact_id: Optional[str] = None
     scheduled_at: datetime
     type: str = "private"
-
-
 class ShowingFeedback(BaseModel):
     feedback_text: str
     feedback_rating: int
-
-
+@router.get("", response_model=List[schemas.ShowingOut])
+def list_showings(
+    db: Session = Depends(get_db),
+    current: auth.TokenData = Depends(auth.require_agent),
+):
+    return (
+        db.query(models.Showing)
+        .filter(models.Showing.agent_id == current.agent_id)
+        .order_by(models.Showing.scheduled_at.asc())
+        .all()
+    )
 @router.post("", status_code=201)
 def schedule_showing(
     payload: ShowingCreate,
@@ -40,8 +43,6 @@ def schedule_showing(
     db.commit()
     db.refresh(showing)
     return showing
-
-
 @router.patch("/{showing_id}/feedback")
 def log_feedback(
     showing_id: str,
@@ -56,10 +57,8 @@ def log_feedback(
     )
     if not showing:
         raise HTTPException(status_code=404, detail="Showing not found")
-
     showing.feedback_text = payload.feedback_text
     showing.feedback_rating = payload.feedback_rating
-
     db.add(models.Activity(
         contact_id=showing.buyer_contact_id,
         agent_id=current.agent_id,
@@ -67,13 +66,11 @@ def log_feedback(
         content=f"Showing feedback: {payload.feedback_text} ({payload.feedback_rating}/5)",
         is_automated=False,
     ))
-
     # Fire any "post_showing" drip campaign this agent has configured
     if showing.buyer_contact_id:
         contact = db.query(models.Contact).get(showing.buyer_contact_id)
         if contact:
             auto_enroll(db, contact, trigger_event="post_showing")
-
     db.commit()
     db.refresh(showing)
     return showing
