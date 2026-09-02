@@ -222,3 +222,45 @@ class AIContentRequest(BaseModel):
 
 class AIContentResponse(BaseModel):
     draft: str
+# ---- Properties ----
+
+class PropertyCreate(BaseModel):
+    address: str
+    mls_number: Optional[str] = None
+    list_price: Optional[float] = None
+    seller_contact_id: Optional[str] = None
+    beds: Optional[int] = None
+    baths: Optional[int] = None
+    sqft: Optional[int] = None
+    status: Optional[str] = "active"
+
+
+class PropertyOut(BaseModel):
+    id: str
+    address: str
+    mls_number: Optional[str] = None
+    list_price: Optional[float] = None
+    status: str
+    days_on_market: Optional[int] = None
+    beds: Optional[int] = None
+    baths: Optional[int] = None
+    sqft: Optional[int] = None
+    seller_contact_id: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ---- Showings ----
+
+class ShowingOut(BaseModel):
+    id: str
+    property_id: str
+    buyer_contact_id: Optional[str] = None
+    scheduled_at: datetime
+    type: str
+    feedback_text: Optional[str] = None
+    feedback_rating: Optional[int] = None
+
+    class Config:
+        from_attributes = True
