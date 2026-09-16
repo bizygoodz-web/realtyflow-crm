@@ -20,7 +20,7 @@ def _launch_scheduler():
         app.state.scheduler = start_scheduler()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your Agent Dashboard + Client Portal origins in production
+    allow_origins=["https://navigation-realty-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
