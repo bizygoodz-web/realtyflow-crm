@@ -1,182 +1,290 @@
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, Request, Header
-from sqlalchemy.orm import Session
+import React, { useEffect, useState } from "react";
+import { FileText, Upload, Download, PenLine, Loader2, X } from "lucide-react";
+import { apiFetch } from "../../api";
 
-from .. import models, schemas, auth
-from ..database import get_db
-from ..services import storage, esign
+const INK = "#132A40";
+const SLATE = "#56606B";
+const MUTED = "#8B94A0";
+const LINE = "#E1E4E2";
+const CLAY = "#A5522F";
 
-router = APIRouter(prefix="/documents", tags=["documents"])
+const STATUS_STYLE = {
+  signed: { bg: "#E9EEE7", fg: "#4F6A4A", label: "Signed" },
+  sent: { bg: "#EFE7D4", fg: "#8C6A34", label: "Awaiting signature" },
+  draft: { bg: "#F5E9E4", fg: "#A5522F", label: "Draft" },
+};
 
+function formatDate(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
 
-def _to_out(doc: models.Document) -> schemas.DocumentOut:
-    """file_url holds the S3 key, never a public link - mint a short-lived
-    signed download url per response instead of persisting one."""
-    return schemas.DocumentOut(
-        id=doc.id,
-        contact_id=doc.contact_id,
-        doc_type=doc.doc_type,
-        status=doc.status,
-        download_url=storage.get_download_url(doc.file_url) if doc.file_url else None,
-        esign_provider_ref=doc.esign_provider_ref,
-        created_at=doc.created_at,
-    )
+function UploadDocumentModal({ isOpen, onClose, onUploaded, contacts }) {
+  const [contactId, setContactId] = useState("");
+  const [docType, setDocType] = useState("");
+  const [file, setFile] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [stage, setStage] = useState(""); // "" | "getting-url" | "uploading" | "confirming"
 
+  if (!isOpen) return null;
 
-@router.get("", response_model=List[schemas.DocumentOut])
-def list_documents(
-    db: Session = Depends(get_db),
-    current: auth.TokenData = Depends(auth.require_agent),
-):
-    docs = (
-        db.query(models.Document)
-        .join(models.Contact, models.Document.contact_id == models.Contact.id)
-        .filter(models.Contact.agent_id == current.agent_id)
-        .order_by(models.Document.created_at.desc())
-        .all()
-    )
-    return [_to_out(d) for d in docs]
+  const contactList = Object.entries(contacts); // [id, name] pairs
 
+  function resetAndClose() {
+    setContactId(""); setDocType(""); setFile(null); setError(""); setStage("");
+    onClose();
+  }
 
-@router.post("/upload-url", response_model=schemas.DocumentUploadURLResponse)
-def get_upload_url(
-    payload: schemas.DocumentUploadURLRequest,
-    db: Session = Depends(get_db),
-    current: auth.TokenData = Depends(auth.require_agent),
-):
-    """Step 1 of upload: mint a presigned S3 PUT url. The file goes straight
-    from the browser to S3 - it never passes through this API."""
-    contact = (
-        db.query(models.Contact)
-        .filter(models.Contact.id == payload.contact_id, models.Contact.agent_id == current.agent_id)
-        .first()
-    )
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contact not found")
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (!file) {
+      setError("Choose a file first.");
+      return;
+    }
+    setError("");
+    setLoading(true);
+    try {
+      // Step 1: ask our backend for a presigned S3 upload URL
+      setStage("getting-url");
+      const urlRes = await apiFetch("/documents/upload-url", {
+        method: "POST",
+        body: JSON.stringify({
+          contact_id: contactId,
+          doc_type: docType,
+          filename: file.name,
+          content_type: file.type || "application/octet-stream",
+        }),
+      });
+      if (!urlRes.ok) {
+        const body = await urlRes.json().catch(() => ({}));
+        throw new Error(body.detail || `Couldn't get an upload URL (${urlRes.status})`);
+      }
+      const { key, upload_url } = await urlRes.json();
 
-    key = storage.build_key(current.agent_id, payload.contact_id, payload.filename)
-    url = storage.get_upload_url(key, payload.content_type)
-    return schemas.DocumentUploadURLResponse(key=key, upload_url=url)
+      // Step 2: upload the actual file bytes straight to S3, not through our
+      // backend - this is a plain fetch (no auth header, no apiFetch), since
+      // the presigned URL itself carries the authorization. Content-Type
+      // MUST match what we told the backend when requesting the URL.
+      setStage("uploading");
+      const putRes = await fetch(upload_url, {
+        method: "PUT",
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+      });
+      if (!putRes.ok) {
+        throw new Error(`Upload to storage failed (${putRes.status}). Double-check the bucket's CORS policy allows this domain.`);
+      }
 
+      // Step 3: confirm with our backend so it creates the Document row
+      setStage("confirming");
+      const confirmRes = await apiFetch("/documents", {
+        method: "POST",
+        body: JSON.stringify({ contact_id: contactId, doc_type: docType, key }),
+      });
+      if (!confirmRes.ok) {
+        const body = await confirmRes.json().catch(() => ({}));
+        throw new Error(body.detail || `Couldn't confirm the upload (${confirmRes.status})`);
+      }
 
-@router.post("", response_model=schemas.DocumentOut, status_code=201)
-def confirm_upload(
-    payload: schemas.DocumentConfirm,
-    db: Session = Depends(get_db),
-    current: auth.TokenData = Depends(auth.require_agent),
-):
-    """Step 2 of upload: after the browser PUTs the file to S3 using the
-    presigned url, call this with the same key to create the Document row."""
-    contact = (
-        db.query(models.Contact)
-        .filter(models.Contact.id == payload.contact_id, models.Contact.agent_id == current.agent_id)
-        .first()
-    )
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contact not found")
+      onUploaded?.();
+      resetAndClose();
+    } catch (err) {
+      setError(err.message || "Something went wrong.");
+    } finally {
+      setLoading(false);
+      setStage("");
+    }
+  }
 
-    doc = models.Document(
-        contact_id=payload.contact_id,
-        deal_id=payload.deal_id,
-        uploaded_by=current.agent_id,
-        doc_type=payload.doc_type,
-        file_url=payload.key,
-        status=models.DocStatus.draft,
-    )
-    db.add(doc)
-    db.add(models.Activity(
-        contact_id=payload.contact_id,
-        deal_id=payload.deal_id,
-        agent_id=current.agent_id,
-        type=models.ActivityType.doc_sent,
-        content=f"{payload.doc_type} uploaded",
-        is_automated=True,
-    ))
-    db.commit()
-    db.refresh(doc)
-    return _to_out(doc)
+  const stageLabel = {
+    "getting-url": "Preparing upload...",
+    "uploading": "Uploading file...",
+    "confirming": "Saving...",
+  }[stage] || "Upload";
 
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(19,42,64,0.45)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={resetAndClose}>
+      <div style={{ background: "#FFFFFF", borderRadius: 16, width: "100%", maxWidth: 420, padding: "24px 26px 26px" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+          <span style={{ fontFamily: "Fraunces, serif", fontSize: 19, fontWeight: 600, color: INK }}>Upload document</span>
+          <button onClick={resetAndClose} style={{ background: "none", border: "none", cursor: "pointer" }}><X size={18} color={MUTED} /></button>
+        </div>
 
-def _owned_document(db: Session, document_id: str, agent_id: str) -> models.Document:
-    doc = (
-        db.query(models.Document)
-        .join(models.Contact, models.Document.contact_id == models.Contact.id)
-        .filter(models.Document.id == document_id, models.Contact.agent_id == agent_id)
-        .first()
-    )
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return doc
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: SLATE, marginBottom: 5 }}>
+              Contact{contactList.length === 0 && <span style={{ color: CLAY }}> — create a contact first</span>}
+            </label>
+            <select
+              value={contactId} onChange={(e) => setContactId(e.target.value)} required
+              style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", borderRadius: 8, border: `1px solid ${LINE}`, fontSize: 13, background: "#FFFFFF" }}
+            >
+              <option value="" disabled>Select a contact...</option>
+              {contactList.map(([id, name]) => (
+                <option key={id} value={id}>{name}</option>
+              ))}
+            </select>
+          </div>
 
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: SLATE, marginBottom: 5 }}>Document type</label>
+            <input
+              value={docType} onChange={(e) => setDocType(e.target.value)} required
+              placeholder="Disclosure, Agreement, Offer..."
+              style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", borderRadius: 8, border: `1px solid ${LINE}`, fontSize: 13 }}
+            />
+          </div>
 
-@router.patch("/{document_id}/status", response_model=schemas.DocumentOut)
-def update_document_status(
-    document_id: str,
-    payload: schemas.DocumentStatusUpdate,
-    db: Session = Depends(get_db),
-    current: auth.TokenData = Depends(auth.require_agent),
-):
-    doc = _owned_document(db, document_id, current.agent_id)
-    doc.status = payload.status
-    db.commit()
-    db.refresh(doc)
-    return _to_out(doc)
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: SLATE, marginBottom: 5 }}>File</label>
+            <input
+              type="file" required onChange={(e) => setFile(e.target.files?.[0] || null)}
+              style={{ width: "100%", fontSize: 12.5, color: SLATE }}
+            />
+          </div>
 
+          {error && <div style={{ background: "#F5E9E4", color: CLAY, fontSize: 12.5, padding: "10px 12px", borderRadius: 8, marginBottom: 14 }}>{error}</div>}
 
-@router.post("/{document_id}/send-for-signature", response_model=schemas.ESignSendResponse)
-def send_for_signature(
-    document_id: str,
-    payload: schemas.ESignSendRequest,
-    db: Session = Depends(get_db),
-    current: auth.TokenData = Depends(auth.require_agent),
-):
-    doc = _owned_document(db, document_id, current.agent_id)
+          <button
+            type="submit" disabled={loading || contactList.length === 0}
+            style={{
+              width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+              background: "#14304A", color: "#F6F7F5", border: "none", borderRadius: 10, padding: "12px 0",
+              fontSize: 13.5, fontWeight: 500, cursor: loading ? "default" : "pointer",
+              opacity: (loading || contactList.length === 0) ? 0.6 : 1,
+            }}
+          >
+            {loading && <Loader2 size={15} className="spin" />}
+            {stageLabel}
+          </button>
+        </form>
+        <style>{`.spin { animation: spin 0.8s linear infinite; } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+      </div>
+    </div>
+  );
+}
 
-    result = esign.create_envelope(doc.id, payload.signer_email, payload.signer_name)
-    doc.esign_provider_ref = result["envelope_id"]
-    doc.status = models.DocStatus.sent
+export default function DocumentsPage() {
+  const [documents, setDocuments] = useState([]);
+  const [contactNames, setContactNames] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [showUpload, setShowUpload] = useState(false);
 
-    db.add(models.Activity(
-        contact_id=doc.contact_id,
-        deal_id=doc.deal_id,
-        agent_id=current.agent_id,
-        type=models.ActivityType.doc_sent,
-        content=f"Sent for signature: {doc.doc_type} -> {payload.signer_email}",
-        is_automated=True,
-    ))
-    db.commit()
-    return schemas.ESignSendResponse(**result)
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const [docsRes, contactsRes] = await Promise.all([
+        apiFetch("/documents"),
+        apiFetch("/contacts"),
+      ]);
+      if (!docsRes.ok) {
+        const body = await docsRes.json().catch(() => ({}));
+        throw new Error(body.detail || `Couldn't load documents (${docsRes.status})`);
+      }
+      const docs = await docsRes.json();
+      setDocuments(docs);
 
+      if (contactsRes.ok) {
+        const contacts = await contactsRes.json();
+        const lookup = {};
+        contacts.forEach((c) => { lookup[c.id] = `${c.first_name} ${c.last_name}`; });
+        setContactNames(lookup);
+      }
+    } catch (err) {
+      setError(err.message || "Couldn't load documents.");
+    } finally {
+      setLoading(false);
+    }
+  }
 
-@router.post("/esign-webhook", include_in_schema=False)
-async def esign_webhook(
-    request: Request,
-    db: Session = Depends(get_db),
-    x_esign_signature: str = Header(default=""),
-):
-    """Public endpoint the e-signature provider calls when a document's
-    status changes. No auth.require_agent here - the caller is the
-    provider, not a logged-in user - so the signature check IS the auth."""
-    raw_body = await request.body()
-    if not esign.verify_webhook_signature(raw_body, x_esign_signature):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+  useEffect(() => {
+    load();
+  }, []);
 
-    payload = await request.json()
-    envelope_id = payload.get("envelope_id")
-    provider_status = payload.get("status", "")
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
+        <button
+          onClick={() => setShowUpload(true)}
+          style={{ display: "flex", alignItems: "center", gap: 7, background: "#14304A", color: "#F6F7F5", border: "none", borderRadius: 8, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: "pointer" }}
+        >
+          <Upload size={15} />
+          Upload document
+        </button>
+      </div>
 
-    doc = db.query(models.Document).filter(models.Document.esign_provider_ref == envelope_id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="No matching document for this envelope")
+      {loading && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "32px 0", justifyContent: "center", color: MUTED, fontSize: 13 }}>
+          <Loader2 size={16} className="spin" />
+          Loading documents...
+          <style>{`.spin { animation: spin 0.8s linear infinite; } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+        </div>
+      )}
 
-    doc.status = esign.normalize_status(provider_status)
-    db.add(models.Activity(
-        contact_id=doc.contact_id,
-        deal_id=doc.deal_id,
-        agent_id=doc.uploaded_by,
-        type=models.ActivityType.doc_sent,
-        content=f"{doc.doc_type} status updated to {doc.status} via e-signature webhook",
-        is_automated=True,
-    ))
-    db.commit()
-    return {"received": True}
+      {!loading && error && (
+        <div style={{ background: "#F5E9E4", color: CLAY, fontSize: 13, padding: "14px 16px", borderRadius: 10, marginBottom: 16 }}>{error}</div>
+      )}
+
+      {!loading && !error && (
+        <div style={{ background: "#FFFFFF", border: `1px solid ${LINE}`, borderRadius: 12, overflow: "hidden" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 1.4fr 1fr 1.2fr 90px", padding: "12px 18px", borderBottom: `1px solid ${LINE}`, fontSize: 11.5, fontWeight: 600, color: MUTED, letterSpacing: "0.03em", textTransform: "uppercase" }}>
+            <span>Document</span>
+            <span>Contact</span>
+            <span>Status</span>
+            <span>Date</span>
+            <span />
+          </div>
+          {documents.map((d) => {
+            const style = STATUS_STYLE[d.status] || STATUS_STYLE.draft;
+            return (
+              <div
+                key={d.id}
+                style={{ display: "grid", gridTemplateColumns: "2fr 1.4fr 1fr 1.2fr 90px", alignItems: "center", padding: "14px 18px", borderBottom: `1px solid ${LINE}` }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ width: 32, height: 32, borderRadius: 8, background: "#F6F7F5", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    <FileText size={15} color={INK} />
+                  </div>
+                  <span style={{ fontSize: 13.5, fontWeight: 500, color: INK }}>{d.doc_type}</span>
+                </div>
+                <span style={{ fontSize: 12.5, color: SLATE }}>{contactNames[d.contact_id] || "—"}</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: style.fg, background: style.bg, borderRadius: 20, padding: "4px 10px", width: "fit-content" }}>
+                  {style.label}
+                </span>
+                <span style={{ fontSize: 12, color: MUTED }}>{formatDate(d.created_at)}</span>
+                <div style={{ display: "flex", gap: 8 }}>
+                  {d.status === "draft" ? (
+                    <button
+                      title="Sending for signature isn't wired up yet"
+                      style={{ background: "none", border: "none", cursor: "not-allowed", padding: 4, opacity: 0.5 }}
+                    >
+                      <PenLine size={15} color={MUTED} />
+                    </button>
+                  ) : d.download_url ? (
+                    <a href={d.download_url} target="_blank" rel="noopener noreferrer" title="Download" style={{ padding: 4, display: "inline-flex" }}>
+                      <Download size={15} color={MUTED} />
+                    </a>
+                  ) : (
+                    <span style={{ padding: 4, display: "inline-flex", opacity: 0.4 }}>
+                      <Download size={15} color={MUTED} />
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {documents.length === 0 && (
+            <div style={{ padding: "32px 18px", textAlign: "center", fontSize: 13, color: MUTED, fontStyle: "italic" }}>
+              No documents yet.
+            </div>
+          )}
+        </div>
+      )}
+
+      <UploadDocumentModal isOpen={showUpload} onClose={() => setShowUpload(false)} onUploaded={load} contacts={contactNames} />
+    </div>
+  );
+}
