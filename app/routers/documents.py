@@ -2,6 +2,8 @@ import React, { useEffect, useState } from "react";
 import { FileText, Upload, Download, PenLine, Loader2, X } from "lucide-react";
 import { apiFetch } from "../../api";
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
+
 const INK = "#132A40";
 const SLATE = "#56606B";
 const MUTED = "#8B94A0";
@@ -19,34 +21,29 @@ function formatDate(iso) {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-function UploadDocumentModal({ isOpen, onClose, onUploaded, contacts }) {
+function UploadModal({ isOpen, onClose, onUploaded, contactList }) {
   const [contactId, setContactId] = useState("");
   const [docType, setDocType] = useState("");
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [stage, setStage] = useState(""); // "" | "getting-url" | "uploading" | "confirming"
+  const [stage, setStage] = useState(""); // for a slightly more honest progress message
 
   if (!isOpen) return null;
 
-  const contactList = Object.entries(contacts); // [id, name] pairs
-
-  function resetAndClose() {
+  function reset() {
     setContactId(""); setDocType(""); setFile(null); setError(""); setStage("");
-    onClose();
   }
 
   async function handleSubmit(e) {
     e.preventDefault();
-    if (!file) {
-      setError("Choose a file first.");
-      return;
-    }
     setError("");
     setLoading(true);
     try {
+      if (!file) throw new Error("Choose a file first.");
+
       // Step 1: ask our backend for a presigned S3 upload URL
-      setStage("getting-url");
+      setStage("Preparing upload...");
       const urlRes = await apiFetch("/documents/upload-url", {
         method: "POST",
         body: JSON.stringify({
@@ -58,37 +55,37 @@ function UploadDocumentModal({ isOpen, onClose, onUploaded, contacts }) {
       });
       if (!urlRes.ok) {
         const body = await urlRes.json().catch(() => ({}));
-        throw new Error(body.detail || `Couldn't get an upload URL (${urlRes.status})`);
+        throw new Error(body.detail || `Couldn't prepare upload (${urlRes.status})`);
       }
       const { key, upload_url } = await urlRes.json();
 
-      // Step 2: upload the actual file bytes straight to S3, not through our
-      // backend - this is a plain fetch (no auth header, no apiFetch), since
-      // the presigned URL itself carries the authorization. Content-Type
-      // MUST match what we told the backend when requesting the URL.
-      setStage("uploading");
-      const putRes = await fetch(upload_url, {
+      // Step 2: upload the actual file bytes straight to S3, bypassing our
+      // backend entirely - this is a plain fetch, not apiFetch, since it's
+      // not one of our API calls and doesn't take our auth header.
+      setStage("Uploading file...");
+      const s3Res = await fetch(upload_url, {
         method: "PUT",
         headers: { "Content-Type": file.type || "application/octet-stream" },
         body: file,
       });
-      if (!putRes.ok) {
-        throw new Error(`Upload to storage failed (${putRes.status}). Double-check the bucket's CORS policy allows this domain.`);
+      if (!s3Res.ok) {
+        throw new Error(`Upload to storage failed (${s3Res.status}). Check the bucket's CORS policy allows this domain.`);
       }
 
-      // Step 3: confirm with our backend so it creates the Document row
-      setStage("confirming");
+      // Step 3: confirm the upload so our backend creates the Document record
+      setStage("Saving record...");
       const confirmRes = await apiFetch("/documents", {
         method: "POST",
         body: JSON.stringify({ contact_id: contactId, doc_type: docType, key }),
       });
       if (!confirmRes.ok) {
         const body = await confirmRes.json().catch(() => ({}));
-        throw new Error(body.detail || `Couldn't confirm the upload (${confirmRes.status})`);
+        throw new Error(body.detail || `Couldn't save the document record (${confirmRes.status})`);
       }
 
+      reset();
       onUploaded?.();
-      resetAndClose();
+      onClose();
     } catch (err) {
       setError(err.message || "Something went wrong.");
     } finally {
@@ -97,18 +94,12 @@ function UploadDocumentModal({ isOpen, onClose, onUploaded, contacts }) {
     }
   }
 
-  const stageLabel = {
-    "getting-url": "Preparing upload...",
-    "uploading": "Uploading file...",
-    "confirming": "Saving...",
-  }[stage] || "Upload";
-
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(19,42,64,0.45)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={resetAndClose}>
+    <div style={{ position: "fixed", inset: 0, background: "rgba(19,42,64,0.45)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={onClose}>
       <div style={{ background: "#FFFFFF", borderRadius: 16, width: "100%", maxWidth: 420, padding: "24px 26px 26px" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
           <span style={{ fontFamily: "Fraunces, serif", fontSize: 19, fontWeight: 600, color: INK }}>Upload document</span>
-          <button onClick={resetAndClose} style={{ background: "none", border: "none", cursor: "pointer" }}><X size={18} color={MUTED} /></button>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer" }}><X size={18} color={MUTED} /></button>
         </div>
 
         <form onSubmit={handleSubmit}>
@@ -131,7 +122,7 @@ function UploadDocumentModal({ isOpen, onClose, onUploaded, contacts }) {
             <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: SLATE, marginBottom: 5 }}>Document type</label>
             <input
               value={docType} onChange={(e) => setDocType(e.target.value)} required
-              placeholder="Disclosure, Agreement, Offer..."
+              placeholder="Disclosure, Agreement, Financing..."
               style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", borderRadius: 8, border: `1px solid ${LINE}`, fontSize: 13 }}
             />
           </div>
@@ -139,8 +130,9 @@ function UploadDocumentModal({ isOpen, onClose, onUploaded, contacts }) {
           <div style={{ marginBottom: 14 }}>
             <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: SLATE, marginBottom: 5 }}>File</label>
             <input
-              type="file" required onChange={(e) => setFile(e.target.files?.[0] || null)}
-              style={{ width: "100%", fontSize: 12.5, color: SLATE }}
+              type="file" required
+              onChange={(e) => setFile(e.target.files?.[0] || null)}
+              style={{ width: "100%", fontSize: 13 }}
             />
           </div>
 
@@ -156,7 +148,7 @@ function UploadDocumentModal({ isOpen, onClose, onUploaded, contacts }) {
             }}
           >
             {loading && <Loader2 size={15} className="spin" />}
-            {stageLabel}
+            {loading ? (stage || "Uploading...") : "Upload"}
           </button>
         </form>
         <style>{`.spin { animation: spin 0.8s linear infinite; } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
@@ -184,8 +176,7 @@ export default function DocumentsPage() {
         const body = await docsRes.json().catch(() => ({}));
         throw new Error(body.detail || `Couldn't load documents (${docsRes.status})`);
       }
-      const docs = await docsRes.json();
-      setDocuments(docs);
+      setDocuments(await docsRes.json());
 
       if (contactsRes.ok) {
         const contacts = await contactsRes.json();
@@ -200,16 +191,19 @@ export default function DocumentsPage() {
     }
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
+
+  const contactList = Object.entries(contactNames);
 
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
         <button
           onClick={() => setShowUpload(true)}
-          style={{ display: "flex", alignItems: "center", gap: 7, background: "#14304A", color: "#F6F7F5", border: "none", borderRadius: 8, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: "pointer" }}
+          style={{
+            display: "flex", alignItems: "center", gap: 7, background: "#14304A", color: "#F6F7F5",
+            border: "none", borderRadius: 8, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: "pointer",
+          }}
         >
           <Upload size={15} />
           Upload document
@@ -225,7 +219,9 @@ export default function DocumentsPage() {
       )}
 
       {!loading && error && (
-        <div style={{ background: "#F5E9E4", color: CLAY, fontSize: 13, padding: "14px 16px", borderRadius: 10, marginBottom: 16 }}>{error}</div>
+        <div style={{ background: "#F5E9E4", color: CLAY, fontSize: 13, padding: "14px 16px", borderRadius: 10, marginBottom: 16 }}>
+          {error}
+        </div>
       )}
 
       {!loading && !error && (
@@ -258,7 +254,7 @@ export default function DocumentsPage() {
                 <div style={{ display: "flex", gap: 8 }}>
                   {d.status === "draft" ? (
                     <button
-                      title="Sending for signature isn't wired up yet"
+                      title="Sending for signature isn't wired up yet - needs a DocuSign/HelloSign account"
                       style={{ background: "none", border: "none", cursor: "not-allowed", padding: 4, opacity: 0.5 }}
                     >
                       <PenLine size={15} color={MUTED} />
@@ -284,7 +280,12 @@ export default function DocumentsPage() {
         </div>
       )}
 
-      <UploadDocumentModal isOpen={showUpload} onClose={() => setShowUpload(false)} onUploaded={load} contacts={contactNames} />
+      <UploadModal
+        isOpen={showUpload}
+        onClose={() => setShowUpload(false)}
+        onUploaded={load}
+        contactList={contactList}
+      />
     </div>
   );
 }
