@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from "react";
-import { FileText, Upload, Download, PenLine, Loader2 } from "lucide-react";
+import React, { useEffect, useState } from "react";
+import { FileText, Upload, Download, PenLine, Loader2, X } from "lucide-react";
 import { apiFetch } from "../../api";
 
 const INK = "#132A40";
@@ -19,154 +19,198 @@ function formatDate(iso) {
   return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-export default function DocumentsPage() {
-  const [documents, setDocuments] = useState([]);
-  const [contactNames, setContactNames] = useState({});
-  const [loading, setLoading] = useState(true);
+function UploadDocumentModal({ isOpen, onClose, onUploaded, contactList }) {
+  const [contactId, setContactId] = useState("");
+  const [docType, setDocType] = useState("");
+  const [file, setFile] = useState(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [stage, setStage] = useState("");
 
-  // Upload state
-  const fileInputRef = useRef(null);
-  const [uploading, setUploading] = useState(false);
-  const [uploadContactId, setUploadContactId] = useState("");
-  const [uploadError, setUploadError] = useState("");
+  if (!isOpen) return null;
 
-  useEffect(() => {
-    async function load() {
-      setLoading(true);
-      setError("");
-      try {
-        const [docsRes, contactsRes] = await Promise.all([
-          apiFetch("/documents"),
-          apiFetch("/contacts"),
-        ]);
-        if (!docsRes.ok) {
-          const body = await docsRes.json().catch(() => ({}));
-          throw new Error(body.detail || `Couldn't load documents (${docsRes.status})`);
-        }
-        setDocuments(await docsRes.json());
+  function resetForm() {
+    setContactId(""); setDocType(""); setFile(null); setError(""); setStage("");
+  }
 
-        if (contactsRes.ok) {
-          const contacts = await contactsRes.json();
-          const lookup = {};
-          contacts.forEach((c) => {
-            lookup[c.id] = `${c.first_name} ${c.last_name}`;
-          });
-          setContactNames(lookup);
-        }
-      } catch (err) {
-        setError(err.message || "Couldn't load documents.");
-      } finally {
-        setLoading(false);
-      }
-    }
-    load();
-  }, []);
-
-  async function handleFileChosen(e) {
-    const file = e.target.files?.[0];
-    e.target.value = ""; // lets the same file be picked again later
-    if (!file) return;
-
-    setUploading(true);
-    setUploadError("");
-    const contentType = file.type || "application/octet-stream";
-
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
     try {
-      // 1. Ask the backend for a presigned S3 upload URL
+      setStage("requesting");
       const urlRes = await apiFetch("/documents/upload-url", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name, content_type: contentType }),
+        body: JSON.stringify({
+          contact_id: contactId,
+          doc_type: docType,
+          filename: file.name,
+          content_type: file.type || "application/octet-stream",
+        }),
       });
       if (!urlRes.ok) {
         const body = await urlRes.json().catch(() => ({}));
-        throw new Error(body.detail || `Couldn't start upload (${urlRes.status})`);
+        throw new Error(body.detail || `Couldn't get an upload URL (${urlRes.status})`);
       }
-      const { upload_url, key } = await urlRes.json();
+      const { key, upload_url } = await urlRes.json();
 
-      // 2. Send the file straight to S3 (plain fetch: no auth header to S3)
-      const putRes = await fetch(upload_url, {
+      setStage("uploading");
+      const s3Res = await fetch(upload_url, {
         method: "PUT",
-        headers: { "Content-Type": contentType },
+        headers: { "Content-Type": file.type || "application/octet-stream" },
         body: file,
       });
-      if (!putRes.ok) throw new Error(`Upload to storage failed (${putRes.status})`);
-
-      // 3. Save the document record
-      const createRes = await apiFetch("/documents", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          doc_type: file.name.replace(/\.[^.]+$/, ""),
-          contact_id: uploadContactId ? Number(uploadContactId) || uploadContactId : null,
-          s3_key: key,
-          status: "draft",
-        }),
-      });
-      if (!createRes.ok) {
-        const body = await createRes.json().catch(() => ({}));
-        throw new Error(body.detail || `Couldn't save document (${createRes.status})`);
+      if (!s3Res.ok) {
+        throw new Error(`Upload to storage failed (${s3Res.status}). Check the bucket's CORS policy allows this domain.`);
       }
-      const created = await createRes.json();
-      setDocuments((prev) => [created, ...prev]);
+
+      setStage("confirming");
+      const confirmRes = await apiFetch("/documents", {
+        method: "POST",
+        body: JSON.stringify({ contact_id: contactId, doc_type: docType, key }),
+      });
+      if (!confirmRes.ok) {
+        const body = await confirmRes.json().catch(() => ({}));
+        throw new Error(body.detail || `File uploaded, but couldn't save the record (${confirmRes.status})`);
+      }
+
+      resetForm();
+      onUploaded?.();
+      onClose();
     } catch (err) {
-      setUploadError(err.message || "Upload failed.");
+      setError(err.message || "Something went wrong during upload.");
     } finally {
-      setUploading(false);
+      setLoading(false);
+      setStage("");
     }
   }
 
+  const stageLabel = { requesting: "Preparing upload...", uploading: "Uploading file...", confirming: "Saving..." }[stage] || "Upload";
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(19,42,64,0.45)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={onClose}>
+      <div style={{ background: "#FFFFFF", borderRadius: 16, width: "100%", maxWidth: 420, padding: "24px 26px 26px" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+          <span style={{ fontFamily: "Fraunces, serif", fontSize: 19, fontWeight: 600, color: INK }}>Upload document</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer" }}><X size={18} color={MUTED} /></button>
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: SLATE, marginBottom: 5 }}>
+              Contact{contactList.length === 0 && <span style={{ color: CLAY }}> — create a contact first</span>}
+            </label>
+            <select
+              value={contactId} onChange={(e) => setContactId(e.target.value)} required
+              style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", borderRadius: 8, border: `1px solid ${LINE}`, fontSize: 13, background: "#FFFFFF" }}
+            >
+              <option value="" disabled>Select a contact...</option>
+              {contactList.map((c) => (
+                <option key={c.id} value={c.id}>{c.first_name} {c.last_name}</option>
+              ))}
+            </select>
+          </div>
+
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: SLATE, marginBottom: 5 }}>Document type</label>
+            <input
+              value={docType} onChange={(e) => setDocType(e.target.value)} required
+              placeholder="e.g. Pre-approval letter, Listing agreement"
+              style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", borderRadius: 8, border: `1px solid ${LINE}`, fontSize: 13 }}
+            />
+          </div>
+
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: SLATE, marginBottom: 5 }}>File</label>
+            <input
+              type="file" required onChange={(e) => setFile(e.target.files?.[0] || null)}
+              style={{ width: "100%", fontSize: 13 }}
+            />
+          </div>
+
+          {error && <div style={{ background: "#F5E9E4", color: CLAY, fontSize: 12.5, padding: "10px 12px", borderRadius: 8, marginBottom: 14 }}>{error}</div>}
+
+          <button
+            type="submit" disabled={loading || contactList.length === 0 || !file}
+            style={{
+              width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+              background: "#14304A", color: "#F6F7F5", border: "none", borderRadius: 10, padding: "12px 0",
+              fontSize: 13.5, fontWeight: 500, cursor: loading ? "default" : "pointer",
+              opacity: (loading || contactList.length === 0 || !file) ? 0.6 : 1,
+            }}
+          >
+            {loading && <Loader2 size={15} className="spin" />}
+            {loading ? stageLabel : "Upload"}
+          </button>
+        </form>
+        <style>{`.spin { animation: spin 0.8s linear infinite; } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+      </div>
+    </div>
+  );
+}
+
+export default function DocumentsPage() {
+  const [documents, setDocuments] = useState([]);
+  const [contactList, setContactList] = useState([]);
+  const [contactNames, setContactNames] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [showUpload, setShowUpload] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const [docsRes, contactsRes] = await Promise.all([
+        apiFetch("/documents"),
+        apiFetch("/contacts"),
+      ]);
+      if (!docsRes.ok) {
+        const body = await docsRes.json().catch(() => ({}));
+        throw new Error(body.detail || `Couldn't load documents (${docsRes.status})`);
+      }
+      setDocuments(await docsRes.json());
+
+      if (contactsRes.ok) {
+        const contacts = await contactsRes.json();
+        setContactList(contacts);
+        const lookup = {};
+        contacts.forEach((c) => { lookup[c.id] = `${c.first_name} ${c.last_name}`; });
+        setContactNames(lookup);
+      }
+    } catch (err) {
+      setError(err.message || "Couldn't load documents.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
   return (
     <div>
-      <style>{`.spin { animation: spin 0.8s linear infinite; } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
-
-      <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginBottom: 14 }}>
-        <select
-          value={uploadContactId}
-          onChange={(e) => setUploadContactId(e.target.value)}
-          disabled={uploading}
-          aria-label="Contact for uploaded document"
-          style={{ border: `1px solid ${LINE}`, borderRadius: 8, padding: "8px 10px", fontSize: 13, color: SLATE, background: "#fff" }}
-        >
-          <option value="">No contact</option>
-          {Object.entries(contactNames).map(([id, name]) => (
-            <option key={id} value={id}>{name}</option>
-          ))}
-        </select>
-
-        <input ref={fileInputRef} type="file" hidden onChange={handleFileChosen} />
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 14 }}>
         <button
-          onClick={() => fileInputRef.current?.click()}
-          disabled={uploading}
-          style={{
-            display: "flex", alignItems: "center", gap: 7, background: "#14304A", color: "#F6F7F5",
-            border: "none", borderRadius: 8, padding: "9px 16px", fontSize: 13, fontWeight: 500,
-            cursor: uploading ? "wait" : "pointer", opacity: uploading ? 0.6 : 1,
-          }}
+          onClick={() => setShowUpload(true)}
+          style={{ display: "flex", alignItems: "center", gap: 7, background: "#14304A", color: "#F6F7F5", border: "none", borderRadius: 8, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: "pointer" }}
         >
-          {uploading ? <Loader2 size={15} className="spin" /> : <Upload size={15} />}
-          {uploading ? "Uploading..." : "Upload document"}
+          <Upload size={15} />
+          Upload document
         </button>
       </div>
-
-      {uploadError && (
-        <div style={{ background: "#F5E9E4", color: CLAY, fontSize: 13, padding: "12px 16px", borderRadius: 10, marginBottom: 14 }}>
-          {uploadError}
-        </div>
-      )}
 
       {loading && (
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "32px 0", justifyContent: "center", color: MUTED, fontSize: 13 }}>
           <Loader2 size={16} className="spin" />
           Loading documents...
+          <style>{`.spin { animation: spin 0.8s linear infinite; } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
         </div>
       )}
 
       {!loading && error && (
-        <div style={{ background: "#F5E9E4", color: CLAY, fontSize: 13, padding: "14px 16px", borderRadius: 10, marginBottom: 16 }}>
-          {error}
-        </div>
+        <div style={{ background: "#F5E9E4", color: CLAY, fontSize: 13, padding: "14px 16px", borderRadius: 10, marginBottom: 16 }}>{error}</div>
       )}
 
       {!loading && !error && (
@@ -196,19 +240,22 @@ export default function DocumentsPage() {
                   {style.label}
                 </span>
                 <span style={{ fontSize: 12, color: MUTED }}>{formatDate(d.created_at)}</span>
-                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                  {d.download_url && (
-                    <a href={d.download_url} target="_blank" rel="noopener noreferrer" title="Download" style={{ padding: 4, display: "inline-flex" }}>
-                      <Download size={15} color={MUTED} />
-                    </a>
-                  )}
-                  {d.status === "draft" && (
+                <div style={{ display: "flex", gap: 8 }}>
+                  {d.status === "draft" ? (
                     <button
                       title="Sending for signature isn't wired up yet"
                       style={{ background: "none", border: "none", cursor: "not-allowed", padding: 4, opacity: 0.5 }}
                     >
                       <PenLine size={15} color={MUTED} />
                     </button>
+                  ) : d.download_url ? (
+                    <a href={d.download_url} target="_blank" rel="noopener noreferrer" title="Download" style={{ padding: 4, display: "inline-flex" }}>
+                      <Download size={15} color={MUTED} />
+                    </a>
+                  ) : (
+                    <span style={{ padding: 4, display: "inline-flex", opacity: 0.4 }}>
+                      <Download size={15} color={MUTED} />
+                    </span>
                   )}
                 </div>
               </div>
@@ -216,11 +263,18 @@ export default function DocumentsPage() {
           })}
           {documents.length === 0 && (
             <div style={{ padding: "32px 18px", textAlign: "center", fontSize: 13, color: MUTED, fontStyle: "italic" }}>
-              No documents yet. Choose a contact and upload your first document.
+              No documents yet.
             </div>
           )}
         </div>
       )}
+
+      <UploadDocumentModal
+        isOpen={showUpload}
+        onClose={() => setShowUpload(false)}
+        onUploaded={load}
+        contactList={contactList}
+      />
     </div>
   );
 }
