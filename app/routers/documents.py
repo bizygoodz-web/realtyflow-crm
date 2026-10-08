@@ -1,55 +1,66 @@
 import os
 import uuid
-import boto3
-from botocore.config import Config
+from typing import Optional, List
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from typing import Optional, List
 from sqlalchemy.orm import Session
 
-# Import your database models and session dependency
+from .. import auth, models
 from ..database import get_db
-from .. import models, auth
+from ..services.storage import build_key, get_upload_url, get_download_url
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
-# --- S3 Configuration ---
-S3_BUCKET = os.getenv("S3_BUCKET_NAME")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-s3_client = boto3.client(
-    "s3",
-    region_name=AWS_REGION,
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    config=Config(signature_version="s3v4"),
-)
-
-
-# --- Schemas ---
 class UploadUrlRequest(BaseModel):
+    contact_id: str
+    doc_type: str
     filename: str
-    content_type: str
+    content_type: str = "application/pdf"
 
 
 class DocumentCreate(BaseModel):
+    contact_id: str
     doc_type: str
-    s3_key: str
-    contact_id: Optional[int] = None
+    file_url: Optional[str] = None
+    key: Optional[str] = None
     status: Optional[str] = "draft"
 
 
-# --- Endpoints ---
+class DocumentOut(BaseModel):
+    id: str
+    contact_id: str
+    doc_type: str
+    status: str
+    file_url: Optional[str] = None
+    download_url: Optional[str] = None
+    created_at: Optional[str] = None
 
-@router.get("/")
-def get_documents(
+    class Config:
+        from_attributes = True
+
+
+def _get_owned_contact(db: Session, contact_id: str, agent_id: str) -> models.Contact:
+    contact = (
+        db.query(models.Contact)
+        .filter(models.Contact.id == contact_id, models.Contact.agent_id == agent_id)
+        .first()
+    )
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return contact
+
+
+@router.get("/", response_model=List[DocumentOut])
+def list_documents(
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    current: auth.TokenData = Depends(auth.require_agent),
 ):
-    """Fetch all documents for the authenticated user and attach presigned download URLs."""
     docs = (
         db.query(models.Document)
-        .filter(models.Document.user_id == current_user.id)
+        .join(models.Contact, models.Contact.id == models.Document.contact_id)
+        .filter(models.Contact.agent_id == current.agent_id)
         .order_by(models.Document.created_at.desc())
         .all()
     )
@@ -57,75 +68,65 @@ def get_documents(
     result = []
     for doc in docs:
         download_url = None
-        if doc.s3_key and S3_BUCKET:
+        if doc.file_url:
             try:
-                download_url = s3_client.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": S3_BUCKET, "Key": doc.s3_key},
-                    ExpiresIn=3600,
-                )
+                download_url = get_download_url(doc.file_url)
             except Exception:
                 download_url = None
 
-        result.append({
-            "id": doc.id,
-            "doc_type": doc.doc_type,
-            "contact_id": doc.contact_id,
-            "status": doc.status,
-            "s3_key": doc.s3_key,
-            "download_url": download_url,
-            "created_at": doc.created_at.isoformat() if doc.created_at else None,
-        })
-
+        result.append(
+            DocumentOut(
+                id=str(doc.id),
+                contact_id=str(doc.contact_id),
+                doc_type=doc.doc_type,
+                status=doc.status.value if hasattr(doc.status, "value") else str(doc.status),
+                file_url=doc.file_url,
+                download_url=download_url,
+                created_at=doc.created_at.isoformat() if doc.created_at else None,
+            )
+        )
     return result
 
 
 @router.post("/upload-url")
 def generate_upload_url(
     payload: UploadUrlRequest,
-    current_user: models.User = Depends(auth.get_current_user),
+    db: Session = Depends(get_db),
+    current: auth.TokenData = Depends(auth.require_agent),
 ):
-    """Generate a presigned S3 URL so the frontend can upload directly to S3."""
-    if not S3_BUCKET:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="S3 bucket is not configured on the server",
-        )
+    _get_owned_contact(db, payload.contact_id, current.agent_id)
 
-    file_extension = payload.filename.split(".")[-1] if "." in payload.filename else ""
-    key = f"uploads/{current_user.id}/{uuid.uuid4()}-{payload.filename}"
-
+    key = build_key(current.agent_id, payload.contact_id, payload.filename)
     try:
-        presigned_url = s3_client.generate_presigned_url(
-            "put_object",
-            Params={
-                "Bucket": S3_BUCKET,
-                "Key": key,
-                "ContentType": payload.content_type,
-            },
-            ExpiresIn=900,
-        )
-    except Exception as e:
+        upload_url = get_upload_url(key, payload.content_type)
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not generate upload URL: {str(e)}",
+            detail=f"Could not generate upload URL: {exc}",
         )
+    return {"key": key, "upload_url": upload_url}
 
-    return {"upload_url": presigned_url, "key": key}
 
-
-@router.post("/")
+@router.post("/", response_model=DocumentOut)
 def create_document(
     payload: DocumentCreate,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    current: auth.TokenData = Depends(auth.require_agent),
 ):
-    """Save the document record in the database after S3 upload succeeds."""
+    _get_owned_contact(db, payload.contact_id, current.agent_id)
+
+    if payload.key:
+        file_url = payload.key
+    elif payload.file_url:
+        file_url = payload.file_url
+    else:
+        raise HTTPException(status_code=400, detail="Either file_url or key is required")
+
     doc = models.Document(
-        user_id=current_user.id,
         contact_id=payload.contact_id,
+        uploaded_by=current.agent_id,
         doc_type=payload.doc_type,
-        s3_key=payload.s3_key,
+        file_url=file_url,
         status=payload.status or "draft",
     )
     db.add(doc)
@@ -133,22 +134,18 @@ def create_document(
     db.refresh(doc)
 
     download_url = None
-    if doc.s3_key and S3_BUCKET:
+    if doc.file_url:
         try:
-            download_url = s3_client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": S3_BUCKET, "Key": doc.s3_key},
-                ExpiresIn=3600,
-            )
+            download_url = get_download_url(doc.file_url)
         except Exception:
             download_url = None
 
-    return {
-        "id": doc.id,
-        "doc_type": doc.doc_type,
-        "contact_id": doc.contact_id,
-        "status": doc.status,
-        "s3_key": doc.s3_key,
-        "download_url": download_url,
-        "created_at": doc.created_at.isoformat() if doc.created_at else None,
-    }
+    return DocumentOut(
+        id=str(doc.id),
+        contact_id=str(doc.contact_id),
+        doc_type=doc.doc_type,
+        status=doc.status.value if hasattr(doc.status, "value") else str(doc.status),
+        file_url=doc.file_url,
+        download_url=download_url,
+        created_at=doc.created_at.isoformat() if doc.created_at else None,
+    )
